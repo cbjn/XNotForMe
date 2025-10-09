@@ -49,12 +49,58 @@ static void refreshLayoutAfterDelay(UIView *view, NSTimeInterval delaySeconds) {
     });
 }
 
+static BOOL isLikelyHorizontalPagingScrollView(UIScrollView *scrollView) {
+    if (!scrollView || !scrollView.pagingEnabled) {
+        return NO;
+    }
+
+    CGRect bounds = scrollView.bounds;
+    CGSize contentSize = scrollView.contentSize;
+
+    CGFloat width = CGRectGetWidth(bounds);
+    CGFloat height = CGRectGetHeight(bounds);
+
+    if (width <= 0.0f || height <= 0.0f) {
+        return NO;
+    }
+
+    CGFloat horizontalDelta = contentSize.width - width;
+    CGFloat verticalDelta = contentSize.height - height;
+
+    BOOL hasMeaningfulHorizontalContent = horizontalDelta > MAX(width * 0.1f, 24.0f);
+    BOOL limitedVerticalExpansion = verticalDelta < MAX(height * 0.25f, 24.0f);
+
+    if (!hasMeaningfulHorizontalContent) {
+        if (scrollView.alwaysBounceHorizontal && !scrollView.alwaysBounceVertical) {
+            hasMeaningfulHorizontalContent = YES;
+        } else if (scrollView.contentOffset.x != 0.0f) {
+            hasMeaningfulHorizontalContent = YES;
+        } else if (scrollView.showsHorizontalScrollIndicator && !scrollView.showsVerticalScrollIndicator && horizontalDelta >= 0.0f) {
+            hasMeaningfulHorizontalContent = YES;
+        }
+    }
+
+    if (!hasMeaningfulHorizontalContent) {
+        return NO;
+    }
+
+    if (limitedVerticalExpansion) {
+        return YES;
+    }
+
+    if (contentSize.width > contentSize.height * 1.5f) {
+        return YES;
+    }
+
+    return NO;
+}
+
 static void collectPagedScrollViewsInView(UIView *view, NSMutableArray<UIScrollView *> *bucket) {
     if (!view) return;
 
     if ([view isKindOfClass:[UIScrollView class]]) {
         UIScrollView *scrollView = (UIScrollView *)view;
-        if (scrollView.pagingEnabled) {
+        if (isLikelyHorizontalPagingScrollView(scrollView)) {
             [bucket addObject:scrollView];
         }
     }
@@ -71,12 +117,21 @@ static void setPagingScrollViewsEnabled(UIView *rootView, BOOL enabled) {
     collectPagedScrollViewsInView(rootView, pagedScrollViews);
 
     for (UIScrollView *scrollView in pagedScrollViews) {
+        UIPanGestureRecognizer *panGesture = scrollView.panGestureRecognizer;
+        BOOL panStateChanged = panGesture ? (panGesture.enabled != enabled) : NO;
+        BOOL stateChanged = (scrollView.scrollEnabled != enabled) ||
+                            panStateChanged ||
+                            (scrollView.bounces != enabled);
+
         scrollView.scrollEnabled = enabled;
-        scrollView.panGestureRecognizer.enabled = enabled;
+        if (panGesture) {
+            panGesture.enabled = enabled;
+        }
         scrollView.bounces = enabled;
-        if (!enabled) {
+
+        if (!enabled && (stateChanged || scrollView.contentOffset.x != 0.0f)) {
             CGPoint offset = scrollView.contentOffset;
-            offset.x = 0.0;
+            offset.x = 0.0f;
             [scrollView setContentOffset:offset animated:NO];
         }
     }
@@ -86,9 +141,19 @@ static void enforceHomeTimelineNoPaging(TFNScrollingSegmentedViewController *con
     if (!controller) return;
 
     setPagingScrollViewsEnabled(controller.view, NO);
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        setPagingScrollViewsEnabled(controller.view, NO);
-    });
+
+    __weak TFNScrollingSegmentedViewController *weakController = controller;
+    const NSTimeInterval retryDelays[] = {0.15, 0.6, 1.2};
+    NSUInteger delayCount = sizeof(retryDelays) / sizeof(NSTimeInterval);
+
+    for (NSUInteger index = 0; index < delayCount; index++) {
+        NSTimeInterval delay = retryDelays[index];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            TFNScrollingSegmentedViewController *strongController = weakController;
+            if (!strongController) return;
+            setPagingScrollViewsEnabled(strongController.view, NO);
+        });
+    }
 }
 
 %hook TFNScrollingSegmentedViewController
@@ -131,6 +196,16 @@ static void enforceHomeTimelineNoPaging(TFNScrollingSegmentedViewController *con
         }
         refreshLayoutAfterDelay(self.view, 0.1); // Slight delay ensures proper rendering
         enforceHomeTimelineNoPaging(self);
+    } else {
+        setPagingScrollViewsEnabled(self.view, YES);
+    }
+}
+
+- (void)viewDidLayoutSubviews {
+    %orig;
+
+    if (isHomeTimelineContainer(self)) {
+        setPagingScrollViewsEnabled(self.view, NO);
     } else {
         setPagingScrollViewsEnabled(self.view, YES);
     }
