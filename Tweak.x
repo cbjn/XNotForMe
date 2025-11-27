@@ -102,6 +102,7 @@ static void collectPagedScrollViewsInView(UIView *view, NSMutableArray<UIScrollV
         UIScrollView *scrollView = (UIScrollView *)view;
         if (isLikelyHorizontalPagingScrollView(scrollView)) {
             [bucket addObject:scrollView];
+            return;
         }
     }
 
