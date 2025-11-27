@@ -9,5 +9,3 @@ Works well for me with X v10.3.2, when also combined with [BHTwitter](https://gi
 ## Installation
 You can compile and bundle the tweak yourself, or download a combined `.ipa` in [releases](https://github.com/n3d1117/XNotForMe/releases) which includes this tweak and BHTwitter.
 
-## Screenshot
-<img src="https://github.com/n3d1117/XNotForMe/assets/11541888/95a0203d-e079-438a-ab69-e2f3a37f43ea" width="300">
