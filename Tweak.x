@@ -29,16 +29,6 @@ static inline BOOL isHomeTimelineContainer(UIViewController *vc) {
     return parent ? [parent isKindOfClass:homeTimelineContainerClass] : NO;
 }
 
-// Cached index path for "Following" tab to avoid repeated allocations
-static inline NSIndexPath *followingTabIndexPath(void) {
-    static NSIndexPath *cachedIndexPath = nil;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        cachedIndexPath = [NSIndexPath indexPathForRow:1 inSection:0];
-    });
-    return cachedIndexPath;
-}
-
 // Helper function to refresh layout after a delay on main thread
 static void refreshLayoutAfterDelay(UIView *view, NSTimeInterval delaySeconds) {
     if (!view) return;
@@ -49,49 +39,33 @@ static void refreshLayoutAfterDelay(UIView *view, NSTimeInterval delaySeconds) {
     });
 }
 
+// Check if scroll view is used for horizontal paging (ForYou/Following swipe)
 static BOOL isLikelyHorizontalPagingScrollView(UIScrollView *scrollView) {
-    if (!scrollView || !scrollView.pagingEnabled) {
-        return NO;
-    }
-
+    if (!scrollView) return NO;
+    
+    // Primary check: paging enabled is the main indicator
+    if (scrollView.pagingEnabled) return YES;
+    
     CGRect bounds = scrollView.bounds;
     CGSize contentSize = scrollView.contentSize;
-
     CGFloat width = CGRectGetWidth(bounds);
     CGFloat height = CGRectGetHeight(bounds);
-
-    if (width <= 0.0f || height <= 0.0f) {
-        return NO;
+    
+    if (width <= 0.0f || height <= 0.0f) return NO;
+    
+    // Check for horizontal scroll capability
+    BOOL hasHorizontalContent = contentSize.width > width + 1.0f;
+    BOOL hasMinimalVerticalScroll = contentSize.height <= height + 50.0f;
+    
+    // Horizontal-only scroll view with multiple pages
+    if (hasHorizontalContent && hasMinimalVerticalScroll) {
+        // Check if content width suggests multiple pages
+        if (contentSize.width >= width * 1.5f) return YES;
     }
-
-    CGFloat horizontalDelta = contentSize.width - width;
-    CGFloat verticalDelta = contentSize.height - height;
-
-    BOOL hasMeaningfulHorizontalContent = horizontalDelta > MAX(width * 0.1f, 24.0f);
-    BOOL limitedVerticalExpansion = verticalDelta < MAX(height * 0.25f, 24.0f);
-
-    if (!hasMeaningfulHorizontalContent) {
-        if (scrollView.alwaysBounceHorizontal && !scrollView.alwaysBounceVertical) {
-            hasMeaningfulHorizontalContent = YES;
-        } else if (scrollView.contentOffset.x != 0.0f) {
-            hasMeaningfulHorizontalContent = YES;
-        } else if (scrollView.showsHorizontalScrollIndicator && !scrollView.showsVerticalScrollIndicator && horizontalDelta >= 0.0f) {
-            hasMeaningfulHorizontalContent = YES;
-        }
-    }
-
-    if (!hasMeaningfulHorizontalContent) {
-        return NO;
-    }
-
-    if (limitedVerticalExpansion) {
-        return YES;
-    }
-
-    if (contentSize.width > contentSize.height * 1.5f) {
-        return YES;
-    }
-
+    
+    // Check bounce settings suggesting horizontal scroll
+    if (scrollView.alwaysBounceHorizontal && !scrollView.alwaysBounceVertical) return YES;
+    
     return NO;
 }
 
@@ -111,6 +85,73 @@ static void collectPagedScrollViewsInView(UIView *view, NSMutableArray<UIScrollV
     }
 }
 
+static void disableHorizontalGesturesForViewAndAncestors(UIView *view, NSUInteger maxAncestorHops) {
+    UIView *current = view;
+    NSUInteger hopCount = 0;
+
+    while (current && hopCount <= maxAncestorHops) {
+        for (UIGestureRecognizer *gesture in current.gestureRecognizers) {
+            if ([gesture isKindOfClass:[UISwipeGestureRecognizer class]]) {
+                UISwipeGestureRecognizer *swipe = (UISwipeGestureRecognizer *)gesture;
+                if (swipe.direction & (UISwipeGestureRecognizerDirectionLeft | UISwipeGestureRecognizerDirectionRight)) {
+                    gesture.enabled = NO;
+                }
+            } else if ([gesture isKindOfClass:[UIPanGestureRecognizer class]] &&
+                       ![gesture isKindOfClass:[UIScreenEdgePanGestureRecognizer class]]) {
+                gesture.enabled = NO;
+            }
+        }
+
+        current = current.superview;
+        hopCount++;
+    }
+}
+
+// Keep the paging scroll view anchored on the Following page (index 1) if available
+static void lockScrollViewToFollowingPage(UIScrollView *scrollView) {
+    if (!scrollView) return;
+
+    CGFloat pageWidth = CGRectGetWidth(scrollView.bounds);
+    if (pageWidth <= 0.0f) return;
+
+    CGFloat maxOffsetX = MAX(0.0f, scrollView.contentSize.width - pageWidth);
+    CGFloat targetOffsetX = MIN(maxOffsetX, pageWidth);
+
+    CGPoint offset = scrollView.contentOffset;
+    if (offset.x != targetOffsetX) {
+        offset.x = targetOffsetX;
+        [scrollView setContentOffset:offset animated:NO];
+    }
+}
+
+static void disableHorizontalScrollOnView(UIScrollView *scrollView) {
+    if (!scrollView) return;
+    
+    lockScrollViewToFollowingPage(scrollView);
+
+    // Disable all horizontal paging/swipe interaction
+    scrollView.pagingEnabled = NO;
+    scrollView.alwaysBounceHorizontal = NO;
+    scrollView.showsHorizontalScrollIndicator = NO;
+    scrollView.bounces = NO;
+    scrollView.scrollEnabled = NO;
+
+    UIPanGestureRecognizer *panGesture = scrollView.panGestureRecognizer;
+    if (panGesture) {
+        panGesture.enabled = NO;
+    }
+
+    for (UIGestureRecognizer *gesture in scrollView.gestureRecognizers) {
+        if ([gesture isKindOfClass:[UISwipeGestureRecognizer class]]) {
+            gesture.enabled = NO;
+        } else if ([gesture isKindOfClass:[UIPanGestureRecognizer class]] && gesture != panGesture) {
+            gesture.enabled = NO;
+        }
+    }
+
+    disableHorizontalGesturesForViewAndAncestors(scrollView, 2);
+}
+
 static void setPagingScrollViewsEnabled(UIView *rootView, BOOL enabled) {
     if (!rootView) return;
 
@@ -118,41 +159,47 @@ static void setPagingScrollViewsEnabled(UIView *rootView, BOOL enabled) {
     collectPagedScrollViewsInView(rootView, pagedScrollViews);
 
     for (UIScrollView *scrollView in pagedScrollViews) {
-        UIPanGestureRecognizer *panGesture = scrollView.panGestureRecognizer;
-        BOOL panStateChanged = panGesture ? (panGesture.enabled != enabled) : NO;
-        BOOL stateChanged = (scrollView.scrollEnabled != enabled) ||
-                            panStateChanged ||
-                            (scrollView.bounces != enabled);
-
-        scrollView.scrollEnabled = enabled;
-        if (panGesture) {
-            panGesture.enabled = enabled;
-        }
-        scrollView.bounces = enabled;
-
-        if (!enabled && (stateChanged || scrollView.contentOffset.x != 0.0f)) {
-            CGPoint offset = scrollView.contentOffset;
-            offset.x = 0.0f;
-            [scrollView setContentOffset:offset animated:NO];
+        if (!enabled) {
+            disableHorizontalScrollOnView(scrollView);
+        } else {
+            // Re-enable if needed
+            scrollView.scrollEnabled = YES;
+            scrollView.bounces = YES;
+            scrollView.pagingEnabled = YES;
+            scrollView.alwaysBounceHorizontal = YES;
+            scrollView.showsHorizontalScrollIndicator = YES;
+            UIPanGestureRecognizer *panGesture = scrollView.panGestureRecognizer;
+            if (panGesture) {
+                panGesture.enabled = YES;
+            }
+            for (UIGestureRecognizer *gesture in scrollView.gestureRecognizers) {
+                if ([gesture isKindOfClass:[UISwipeGestureRecognizer class]] || [gesture isKindOfClass:[UIPanGestureRecognizer class]]) {
+                    gesture.enabled = YES;
+                }
+            }
         }
     }
 }
 
-static void enforceHomeTimelineNoPaging(TFNScrollingSegmentedViewController *controller) {
-    if (!controller) return;
-
+static void applyHomeTimelinePagingLock(TFNScrollingSegmentedViewController *controller) {
+    if (!controller || !controller.view) return;
     setPagingScrollViewsEnabled(controller.view, NO);
+}
+
+static void enforceHomeTimelineNoPaging(TFNScrollingSegmentedViewController *controller) {
+    if (!controller || !controller.view) return;
+
+    applyHomeTimelinePagingLock(controller);
 
     __weak TFNScrollingSegmentedViewController *weakController = controller;
-    const NSTimeInterval retryDelays[] = {0.15, 0.6, 1.2};
-    NSUInteger delayCount = sizeof(retryDelays) / sizeof(NSTimeInterval);
-
-    for (NSUInteger index = 0; index < delayCount; index++) {
-        NSTimeInterval delay = retryDelays[index];
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    
+    // Apply multiple times to catch any late-added paging scroll views
+    NSArray<NSNumber *> *delays = @[@(0.4), @(1.0), @(2.0)];
+    for (NSNumber *delay in delays) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay.doubleValue * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             TFNScrollingSegmentedViewController *strongController = weakController;
-            if (!strongController) return;
-            setPagingScrollViewsEnabled(strongController.view, NO);
+            if (!strongController || !strongController.view) return;
+            applyHomeTimelinePagingLock(strongController);
         });
     }
 }
@@ -164,41 +211,23 @@ static void enforceHomeTimelineNoPaging(TFNScrollingSegmentedViewController *con
     return isHomeTimelineContainer(self) ? YES : %orig;
 }
 
-// Always load "Following" tab content for homepage timeline container; otherwise default behavior.
-- (UIViewController *)pagingViewController:(id)viewCtrl viewControllerAtIndexPath:(NSIndexPath *)indexPath {
-    if (isHomeTimelineContainer(self)) {
-        return %orig(viewCtrl, followingTabIndexPath());
-    }
-
-    return %orig(viewCtrl, indexPath);
-}
-
-// Ensure selected tab defaults to "Following" upon loading homepage timeline container.
+// Ensure proper view loading and prevent white screen, only on homepage
 - (void)viewDidLoad {
     %orig;
 
     if (isHomeTimelineContainer(self)) {
-        if ([self selectedIndex] != 1) {
-            [self setSelectedIndex:1]; // Set directly to Following tab at startup
-        }
-        enforceHomeTimelineNoPaging(self);
-    } else {
-        setPagingScrollViewsEnabled(self.view, YES);
+        [self setSelectedIndex:1];
     }
 }
 
-// Fix potential white screen issue by forcing layout update shortly after appearing.
+// Additional fix for view appearance to ensure content loads properly, only on homepage
 - (void)viewDidAppear:(BOOL)animated {
-    %orig(animated);
+    %orig;
 
     if (isHomeTimelineContainer(self)) {
-        if ([self selectedIndex] != 1) {
-            [self setSelectedIndex:1];
-        }
-        refreshLayoutAfterDelay(self.view, 0.1); // Slight delay ensures proper rendering
+        [self setSelectedIndex:1];
+        refreshLayoutAfterDelay(self.view, 0.1);
         enforceHomeTimelineNoPaging(self);
-    } else {
-        setPagingScrollViewsEnabled(self.view, YES);
     }
 }
 
@@ -206,32 +235,28 @@ static void enforceHomeTimelineNoPaging(TFNScrollingSegmentedViewController *con
     %orig;
 
     if (isHomeTimelineContainer(self)) {
-        setPagingScrollViewsEnabled(self.view, NO);
-    } else {
-        setPagingScrollViewsEnabled(self.view, YES);
+        applyHomeTimelinePagingLock(self);
     }
 }
 
-// Prevent changing away from "Following" tab when on homepage timeline container.
-- (void)setSelectedIndex:(NSInteger)newIndex {
-    BOOL isHome = isHomeTimelineContainer(self);
-    NSInteger targetIndex = isHome ? 1 : newIndex;
 
-    if (isHome && [self selectedIndex] == targetIndex) {
-        return;
+// Ensure selected index is always the Following tab, only on homepage
+- (void)setSelectedIndex:(NSInteger)index {
+    if (isHomeTimelineContainer(self)) {
+        %orig(1); // Always set to Following tab (index 1)
+    } else {
+        %orig(index); // Use the original index for other interfaces
     }
-
-    %orig(targetIndex);
 }
 
 %end
 
+// Fix refresh functionality
 %hook THFTimelineViewController
 
-// Fix pull-to-refresh functionality by ensuring proper layout updates afterward.
-- (void)_pullToRefresh:(id)sender { 
-   %orig(sender);
-   refreshLayoutAfterDelay(self.view, 0.5); // Delay slightly longer for reliable UI update after refreshing data 
+- (void)_pullToRefresh:(id)sender {
+    %orig;
+    refreshLayoutAfterDelay(self.view, 0.5);
 }
 
 %end
