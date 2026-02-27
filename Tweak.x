@@ -1,4 +1,5 @@
 #import <UIKit/UIKit.h>
+#import <objc/runtime.h>
 
 @interface TFNScrollingSegmentedViewController : UIViewController
 - (void)setSelectedIndex:(NSInteger)index;
@@ -35,54 +36,49 @@ static void refreshLayoutAfterDelay(UIView *view, NSTimeInterval delaySeconds) {
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delaySeconds * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         [view setNeedsLayout];
-        [view layoutIfNeeded];
     });
 }
+
+static char kIsPagingScrollViewKey;
 
 // Check if scroll view is used for horizontal paging (ForYou/Following swipe)
 static BOOL isLikelyHorizontalPagingScrollView(UIScrollView *scrollView) {
     if (!scrollView) return NO;
     
+    NSNumber *cached = objc_getAssociatedObject(scrollView, &kIsPagingScrollViewKey);
+    if (cached) return cached.boolValue;
+
+    BOOL isPaging = NO;
+    
     // Primary check: paging enabled is the main indicator
-    if (scrollView.pagingEnabled) return YES;
-    
-    CGRect bounds = scrollView.bounds;
-    CGSize contentSize = scrollView.contentSize;
-    CGFloat width = CGRectGetWidth(bounds);
-    CGFloat height = CGRectGetHeight(bounds);
-    
-    if (width <= 0.0f || height <= 0.0f) return NO;
-    
-    // Check for horizontal scroll capability
-    BOOL hasHorizontalContent = contentSize.width > width + 1.0f;
-    BOOL hasMinimalVerticalScroll = contentSize.height <= height + 50.0f;
-    
-    // Horizontal-only scroll view with multiple pages
-    if (hasHorizontalContent && hasMinimalVerticalScroll) {
-        // Check if content width suggests multiple pages
-        if (contentSize.width >= width * 1.5f) return YES;
-    }
-    
-    // Check bounce settings suggesting horizontal scroll
-    if (scrollView.alwaysBounceHorizontal && !scrollView.alwaysBounceVertical) return YES;
-    
-    return NO;
-}
-
-static void collectPagedScrollViewsInView(UIView *view, NSMutableArray<UIScrollView *> *bucket) {
-    if (!view) return;
-
-    if ([view isKindOfClass:[UIScrollView class]]) {
-        UIScrollView *scrollView = (UIScrollView *)view;
-        if (isLikelyHorizontalPagingScrollView(scrollView)) {
-            [bucket addObject:scrollView];
-            return;
+    if (scrollView.pagingEnabled) {
+        isPaging = YES;
+    } else {
+        CGRect bounds = scrollView.bounds;
+        CGSize contentSize = scrollView.contentSize;
+        CGFloat width = CGRectGetWidth(bounds);
+        CGFloat height = CGRectGetHeight(bounds);
+        
+        if (width > 0.0f && height > 0.0f) {
+            // Check for horizontal scroll capability
+            BOOL hasHorizontalContent = contentSize.width > width + 1.0f;
+            BOOL hasMinimalVerticalScroll = contentSize.height <= height + 50.0f;
+            
+            // Horizontal-only scroll view with multiple pages
+            if (hasHorizontalContent && hasMinimalVerticalScroll) {
+                // Check if content width suggests multiple pages
+                if (contentSize.width >= width * 1.5f) isPaging = YES;
+            }
+            
+            // Check bounce settings suggesting horizontal scroll
+            if (!isPaging && scrollView.alwaysBounceHorizontal && !scrollView.alwaysBounceVertical) {
+                isPaging = YES;
+            }
         }
     }
-
-    for (UIView *subview in view.subviews) {
-        collectPagedScrollViewsInView(subview, bucket);
-    }
+    
+    objc_setAssociatedObject(scrollView, &kIsPagingScrollViewKey, @(isPaging), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return isPaging;
 }
 
 static void disableHorizontalGesturesForViewAndAncestors(UIView *view, NSUInteger maxAncestorHops) {
@@ -94,11 +90,11 @@ static void disableHorizontalGesturesForViewAndAncestors(UIView *view, NSUIntege
             if ([gesture isKindOfClass:[UISwipeGestureRecognizer class]]) {
                 UISwipeGestureRecognizer *swipe = (UISwipeGestureRecognizer *)gesture;
                 if (swipe.direction & (UISwipeGestureRecognizerDirectionLeft | UISwipeGestureRecognizerDirectionRight)) {
-                    gesture.enabled = NO;
+                    if (gesture.enabled) gesture.enabled = NO;
                 }
             } else if ([gesture isKindOfClass:[UIPanGestureRecognizer class]] &&
                        ![gesture isKindOfClass:[UIScreenEdgePanGestureRecognizer class]]) {
-                gesture.enabled = NO;
+                if (gesture.enabled) gesture.enabled = NO;
             }
         }
 
@@ -130,60 +126,47 @@ static void disableHorizontalScrollOnView(UIScrollView *scrollView) {
     lockScrollViewToFollowingPage(scrollView);
 
     // Disable all horizontal paging/swipe interaction
-    scrollView.pagingEnabled = NO;
-    scrollView.alwaysBounceHorizontal = NO;
-    scrollView.showsHorizontalScrollIndicator = NO;
-    scrollView.bounces = NO;
-    scrollView.scrollEnabled = NO;
+    if (scrollView.pagingEnabled) scrollView.pagingEnabled = NO;
+    if (scrollView.alwaysBounceHorizontal) scrollView.alwaysBounceHorizontal = NO;
+    if (scrollView.showsHorizontalScrollIndicator) scrollView.showsHorizontalScrollIndicator = NO;
+    if (scrollView.bounces) scrollView.bounces = NO;
+    if (scrollView.scrollEnabled) scrollView.scrollEnabled = NO;
 
     UIPanGestureRecognizer *panGesture = scrollView.panGestureRecognizer;
-    if (panGesture) {
+    if (panGesture && panGesture.enabled) {
         panGesture.enabled = NO;
     }
 
     for (UIGestureRecognizer *gesture in scrollView.gestureRecognizers) {
         if ([gesture isKindOfClass:[UISwipeGestureRecognizer class]]) {
-            gesture.enabled = NO;
+            if (gesture.enabled) gesture.enabled = NO;
         } else if ([gesture isKindOfClass:[UIPanGestureRecognizer class]] && gesture != panGesture) {
-            gesture.enabled = NO;
+            if (gesture.enabled) gesture.enabled = NO;
         }
     }
 
     disableHorizontalGesturesForViewAndAncestors(scrollView, 2);
 }
 
-static void setPagingScrollViewsEnabled(UIView *rootView, BOOL enabled) {
-    if (!rootView) return;
+static void scanAndDisablePagedScrollViews(UIView *view) {
+    if (!view) return;
 
-    NSMutableArray<UIScrollView *> *pagedScrollViews = [NSMutableArray array];
-    collectPagedScrollViewsInView(rootView, pagedScrollViews);
-
-    for (UIScrollView *scrollView in pagedScrollViews) {
-        if (!enabled) {
+    if ([view isKindOfClass:[UIScrollView class]]) {
+        UIScrollView *scrollView = (UIScrollView *)view;
+        if (isLikelyHorizontalPagingScrollView(scrollView)) {
             disableHorizontalScrollOnView(scrollView);
-        } else {
-            // Re-enable if needed
-            scrollView.scrollEnabled = YES;
-            scrollView.bounces = YES;
-            scrollView.pagingEnabled = YES;
-            scrollView.alwaysBounceHorizontal = YES;
-            scrollView.showsHorizontalScrollIndicator = YES;
-            UIPanGestureRecognizer *panGesture = scrollView.panGestureRecognizer;
-            if (panGesture) {
-                panGesture.enabled = YES;
-            }
-            for (UIGestureRecognizer *gesture in scrollView.gestureRecognizers) {
-                if ([gesture isKindOfClass:[UISwipeGestureRecognizer class]] || [gesture isKindOfClass:[UIPanGestureRecognizer class]]) {
-                    gesture.enabled = YES;
-                }
-            }
+            return;
         }
+    }
+
+    for (UIView *subview in view.subviews) {
+        scanAndDisablePagedScrollViews(subview);
     }
 }
 
 static void applyHomeTimelinePagingLock(TFNScrollingSegmentedViewController *controller) {
     if (!controller || !controller.view) return;
-    setPagingScrollViewsEnabled(controller.view, NO);
+    scanAndDisablePagedScrollViews(controller.view);
 }
 
 static void enforceHomeTimelineNoPaging(TFNScrollingSegmentedViewController *controller) {
@@ -194,9 +177,9 @@ static void enforceHomeTimelineNoPaging(TFNScrollingSegmentedViewController *con
     __weak TFNScrollingSegmentedViewController *weakController = controller;
     
     // Apply multiple times to catch any late-added paging scroll views
-    NSArray<NSNumber *> *delays = @[@(0.4), @(1.0), @(2.0)];
-    for (NSNumber *delay in delays) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay.doubleValue * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    const double delays[] = {0.4, 1.0, 2.0};
+    for (int i = 0; i < 3; i++) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delays[i] * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             TFNScrollingSegmentedViewController *strongController = weakController;
             if (!strongController || !strongController.view) return;
             applyHomeTimelinePagingLock(strongController);
