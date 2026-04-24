@@ -177,8 +177,8 @@ static void enforceHomeTimelineNoPaging(TFNScrollingSegmentedViewController *con
     __weak TFNScrollingSegmentedViewController *weakController = controller;
     
     // Apply multiple times to catch any late-added paging scroll views
-    const double delays[] = {0.4, 1.0, 2.0};
-    for (int i = 0; i < 3; i++) {
+    const double delays[] = {0.4, 1.0};
+    for (int i = 0; i < 2; i++) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delays[i] * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             TFNScrollingSegmentedViewController *strongController = weakController;
             if (!strongController || !strongController.view) return;
